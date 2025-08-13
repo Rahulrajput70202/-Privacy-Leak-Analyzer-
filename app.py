@@ -1,14 +1,30 @@
+#!/usr/bin/env python3
 import os
 import json
-from flask import Flask, request, render_template_string
-from androguard.misc import AnalyzeAPK
+import time
+import uuid
+import hashlib
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from flask import Flask, request, render_template, abort, jsonify
+from werkzeug.utils import secure_filename
 
-app = Flask(__name__)
+# Lazy imports are used inside analysis functions to speed app startup
+# APK deep analysis uses Androguard; EXE uses pefile
+
+app = Flask(__name__, static_folder="static", template_folder="templates")
+
+# --- Configuration ---
 UPLOAD_FOLDER = "uploads"
 REPORT_FOLDER = "reports"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(REPORT_FOLDER, exist_ok=True)
 
+# --- Shared task state (in-memory) ---
+TASKS = {}  # task_id -> dict
+TASKS_LOCK = threading.Lock()
+
+# --- APK Analysis Configuration ---
 DANGEROUS_PERMISSIONS = {
     'android.permission.READ_SMS',
     'android.permission.RECORD_AUDIO',
@@ -16,241 +32,275 @@ DANGEROUS_PERMISSIONS = {
     'android.permission.ACCESS_FINE_LOCATION',
     'android.permission.WRITE_EXTERNAL_STORAGE',
     'android.permission.READ_CONTACTS',
-    'android.permission.SEND_SMS'
+    'android.permission.SEND_SMS',
+    'android.permission.INSTALL_PACKAGES'
 }
 
-def analyze_apk(apk_path):
-    a, d, dx = AnalyzeAPK(apk_path)
-    used_permissions = set(a.get_permissions())
-    risky_permissions = used_permissions & DANGEROUS_PERMISSIONS
+# --- EXE Analysis Configuration ---
+SUSPICIOUS_IMPORTS = {
+    'socket','send','recv','connect','inet_addr','gethostbyname',
+    'CreateRemoteThread','WriteProcessMemory','OpenProcess','VirtualAllocEx',
+    'SetWindowsHookExA','GetAsyncKeyState','GetKeyState',
+    'CreateFileA','WriteFile','ReadFile','RegCreateKeyExA','RegSetValueExA'
+}
+SUSPICIOUS_STRINGS = [b'http://', b'https://', b'keylog', b'stealer', b'exploit']
+
+# --- Utility ---
+def init_task(mode="fast"):
+    task_id = uuid.uuid4().hex
+    with TASKS_LOCK:
+        TASKS[task_id] = {
+            "progress": 0,
+            "status": "Queued…",
+            "done": False,
+            "result": None,
+            "error": None,
+            "report_path": None,
+            "mode": mode
+        }
+    return task_id
+
+def set_progress(task_id, progress=None, status=None, **kw):
+    with TASKS_LOCK:
+        task = TASKS.get(task_id)
+        if not task:
+            return
+        if progress is not None:
+            task["progress"] = max(task["progress"], int(progress))
+        if status is not None:
+            task["status"] = status
+        for k,v in kw.items():
+            task[k] = v
+
+# --- APK Analysis (Fast & Deep) ---
+def analyze_apk_fast(apk_path, task_id):
+    """Fast mode: manifest/permissions only (no DEX). Very quick."""
+    set_progress(task_id, 12, "Parsing APK (fast)…")
+    from androguard.core.bytecodes.apk import APK  # lazy import
+    apk = APK(apk_path, raw=True)
+    set_progress(task_id, 28, "Extracting permissions…")
+    used_permissions = set(apk.get_permissions())
+    risky_permissions = used_permissions.intersection(DANGEROUS_PERMISSIONS)
+
+    # Optional: simple cleartext traffic hint from manifest (best-effort)
+    insecure_apis = []
+    try:
+        axml = apk.get_android_manifest_xml()
+        # look for usesCleartextTraffic="true"
+        if axml and b'usesCleartextTraffic="true"' in apk.get_android_manifest_axml().get_buff():
+            insecure_apis.append("Manifest allows cleartext traffic")
+    except Exception:
+        pass
+
+    set_progress(task_id, 70, "Scoring…")
+    score = len(risky_permissions)*2 + len(insecure_apis)*2
+    max_score = 12*2 + 5*2  # heuristic
 
     result = {
-        "app_name": a.get_app_name(),
-        "package": a.get_package(),
-        "permissions": list(used_permissions),
-        "risky_permissions": list(risky_permissions),
-        "insecure_apis": [],
-        "risk_score": 0,
-        "risk_level": "Low"
+        "file_type": "Android APK",
+        "app_name": apk.get_app_name(),
+        "package": apk.get_package(),
+        "details_list": sorted(used_permissions),
+        "risky_list": sorted(risky_permissions),
+        "insecure_list": insecure_apis,
+        "risk_score": int(score),
+        "max_score": int(max_score),
+        "risk_level": "High" if score > 10 else "Medium" if score > 5 else "Low",
+        "headings": {
+            "details": "🔐 Used Permissions",
+            "risky": "🚨 Risky Permissions",
+            "insecure": "🛡️ Insecure Config / APIs"
+        }
     }
-
-    for method in dx.get_methods():
-        method_str = method.method.get_class_name() + "->" + method.method.get_name()
-        if 'WebView' in method_str and 'addJavascriptInterface' in method_str:
-            result["insecure_apis"].append(method_str)
-        if 'HttpURLConnection' in method_str:
-            result["insecure_apis"].append(method_str)
-        if 'openConnection' in method_str and 'java/net/URL' in method_str:
-            result["insecure_apis"].append(method_str)
-
-    score = len(risky_permissions) * 2 + len(result["insecure_apis"]) * 3
-    result["risk_score"] = score
-    result["risk_level"] = (
-        "High" if score > 10 else
-        "Medium" if score > 5 else
-        "Low"
-    )
-
-    with open(f"{REPORT_FOLDER}/{result['package']}.json", "w") as f:
-        json.dump(result, f, indent=4)
-
+    set_progress(task_id, 88, "Finalizing…")
     return result
 
-# Stylish index upload page
-INDEX_HTML = '''
-<!DOCTYPE html>
-<html>
-<head>
-  <title>Privacy Leak Analyzer</title>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap" rel="stylesheet">
-  <style>
-    body {
-      font-family: 'Inter', sans-serif;
-      background: linear-gradient(to right, #667eea, #764ba2);
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      height: 100vh;
-      margin: 0;
-    }
-    .container {
-      background: rgba(255, 255, 255, 0.1);
-      backdrop-filter: blur(12px);
-      padding: 40px;
-      border-radius: 15px;
-      box-shadow: 0 8px 30px rgba(0,0,0,0.2);
-      width: 400px;
-      text-align: center;
-      color: #fff;
-    }
-    h2 {
-      margin-bottom: 20px;
-      font-weight: 600;
-    }
-    input[type=file] {
-      margin: 20px 0;
-      padding: 10px;
-      border-radius: 8px;
-      background: #fff;
-      border: none;
-      width: 100%;
-    }
-    button {
-      background: #00c9a7;
-      color: white;
-      border: none;
-      padding: 12px 20px;
-      border-radius: 8px;
-      cursor: pointer;
-      font-size: 16px;
-      font-weight: 600;
-      width: 100%;
-    }
-    button:hover {
-      background: #02b093;
-    }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <h2>🔐 Privacy Leak Analyzer</h2>
-    <form method="POST" enctype="multipart/form-data">
-      <input type="file" name="apk" required><br>
-      <button type="submit">Scan APK</button>
-    </form>
-  </div>
-</body>
-</html>
-'''
+def analyze_apk_deep(apk_path, task_id):
+    """Deep mode: includes selective DEX analysis for risky APIs."""
+    set_progress(task_id, 10, "Parsing APK (deep)…")
+    from androguard.misc import AnalyzeAPK  # lazy import
+    a, _, dx = AnalyzeAPK(apk_path)
 
-# Stylish result page
-RESULT_HTML = '''
-<!DOCTYPE html>
-<html>
-<head>
-  <title>Scan Report</title>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap" rel="stylesheet">
-  <style>
-    body {
-      font-family: 'Inter', sans-serif;
-      background: linear-gradient(to right, #43cea2, #185a9d);
-      padding: 30px;
-      color: #fff;
-    }
-    .report {
-      background: rgba(255, 255, 255, 0.08);
-      backdrop-filter: blur(12px);
-      max-width: 900px;
-      margin: auto;
-      padding: 30px 40px;
-      border-radius: 15px;
-      box-shadow: 0 10px 40px rgba(0,0,0,0.3);
-    }
-    h2 {
-      font-weight: 600;
-      margin-bottom: 10px;
-    }
-    h3 {
-      margin-top: 30px;
-      font-weight: 600;
-    }
-    ul {
-      background: rgba(255,255,255,0.05);
-      padding: 15px 25px;
-      border-radius: 8px;
-    }
-    li {
-      margin-bottom: 5px;
-    }
-    .tag {
-      padding: 6px 12px;
-      border-radius: 6px;
-      font-weight: bold;
-    }
-    .Low { background: #28a745; color: #fff; }
-    .Medium { background: #ffc107; color: #333; }
-    .High { background: #dc3545; color: #fff; }
-    a {
-      display: inline-block;
-      margin-top: 25px;
-      color: #00ffe1;
-      text-decoration: none;
-      font-weight: 600;
-    }
-    a:hover {
-      text-decoration: underline;
-    }
-    canvas {
-      max-width: 100%;
-      margin-top: 30px;
-    }
-  </style>
-</head>
-<body>
-  <div class="report">
-    <h2>📋 Report for: {{ result.app_name }}</h2>
-    <p><strong>📦 Package:</strong> {{ result.package }}</p>
-    <p><strong>⚠️ Risk Level:</strong> <span class="tag {{ result.risk_level }}">{{ result.risk_level }}</span></p>
-    <p><strong>📈 Risk Score:</strong> {{ result.risk_score }}</p>
+    set_progress(task_id, 30, "Extracting permissions…")
+    used_permissions = set(a.get_permissions())
+    risky_permissions = used_permissions.intersection(DANGEROUS_PERMISSIONS)
 
-    <canvas id="riskChart"></canvas>
+    insecure_apis = []
+    # selective method scans (keep minimal for speed)
+    set_progress(task_id, 52, "Scanning WebView bridges…")
+    if list(dx.find_methods(classname="Landroid/webkit/WebView;", methodname="addJavascriptInterface")):
+        insecure_apis.append("WebView -> addJavascriptInterface (Potential RCE)")
 
-    <h3>🔐 Used Permissions:</h3>
-    <ul>{% for p in result.permissions %}<li>{{ p }}</li>{% endfor %}</ul>
+    set_progress(task_id, 66, "Scanning HTTP APIs…")
+    if list(dx.find_methods(classname="Ljava/net/HttpURLConnection;")):
+        insecure_apis.append("java.net.HttpURLConnection (Potential unencrypted traffic)")
+    if list(dx.find_methods(classname="Ljava/net/URL;", methodname="openConnection")):
+        insecure_apis.append("java.net.URL -> openConnection (Potential unencrypted traffic)")
 
-    <h3>🚨 Risky Permissions:</h3>
-    <ul>{% for p in result.risky_permissions %}<li>{{ p }}</li>{% endfor %}</ul>
+    set_progress(task_id, 82, "Scoring…")
+    score = len(risky_permissions)*2 + len(insecure_apis)*3
+    max_score = 12*2 + 5*3  # heuristic
 
-    <h3>🛡️ Insecure API Usage:</h3>
-    <ul>{% for api in result.insecure_apis %}<li>{{ api }}</li>{% endfor %}</ul>
-
-    <a href="/">⬅️ Scan Another APK</a>
-  </div>
-
-  <script>
-    const ctx = document.getElementById('riskChart');
-    const chart = new Chart(ctx, {
-        type: 'bar',
-        data: {
-            labels: ['Total Permissions', 'Risky Permissions', 'Insecure APIs', 'Risk Score'],
-            datasets: [{
-                label: 'Privacy Risk Metrics',
-                data: [{{ result.permissions|length }}, {{ result.risky_permissions|length }}, {{ result.insecure_apis|length }}, {{ result.risk_score }}],
-                backgroundColor: ['#3498db', '#f1c40f', '#e74c3c', '#95a5a6'],
-                borderRadius: 10
-            }]
-        },
-        options: {
-            plugins: {
-                legend: { display: false }
-            },
-            scales: {
-                y: { beginAtZero: true }
-            }
+    result = {
+        "file_type": "Android APK",
+        "app_name": a.get_app_name(),
+        "package": a.get_package(),
+        "details_list": sorted(used_permissions),
+        "risky_list": sorted(risky_permissions),
+        "insecure_list": insecure_apis,
+        "risk_score": int(score),
+        "max_score": int(max_score),
+        "risk_level": "High" if score > 10 else "Medium" if score > 5 else "Low",
+        "headings": {
+            "details": "🔐 Used Permissions",
+            "risky": "🚨 Risky Permissions",
+            "insecure": "🛡️ Insecure API Usage"
         }
-    });
-  </script>
-</body>
-</html>
-'''
+    }
+    set_progress(task_id, 88, "Finalizing…")
+    return result
 
+# --- EXE Analysis ---
+def analyze_exe(exe_path, task_id):
+    set_progress(task_id, 8, "Parsing EXE…")
+    import pefile  # lazy import
+
+    pe = pefile.PE(exe_path)
+    set_progress(task_id, 24, "Hashing file…")
+    with open(exe_path, 'rb') as f:
+        data = f.read()
+        sha = hashlib.sha256(data).hexdigest()
+
+    set_progress(task_id, 48, "Analyzing imports…")
+    risky_imports = set()
+    if hasattr(pe, 'DIRECTORY_ENTRY_IMPORT'):
+        for entry in pe.DIRECTORY_ENTRY_IMPORT:
+            for imp in entry.imports:
+                name = ""
+                try:
+                    name = imp.name.decode() if imp.name else ""
+                except Exception:
+                    pass
+                if name in SUSPICIOUS_IMPORTS:
+                    risky_imports.add(name)
+
+    set_progress(task_id, 70, "Searching strings…")
+    found_strings = set()
+    for s in SUSPICIOUS_STRINGS:
+        if s in data:
+            try:
+                found_strings.add(s.decode('utf-8', 'ignore'))
+            except Exception:
+                pass
+
+    set_progress(task_id, 84, "Scoring…")
+    score = len(risky_imports)*3 + len(found_strings)*1
+    max_score = 10*3 + 8*1
+
+    result = {
+        "file_type": "Windows EXE",
+        "app_name": os.path.basename(exe_path),
+        "package": sha[:20] + "...",
+        "details_list": [f"{s} (string found)" for s in sorted(found_strings)],
+        "risky_list": sorted(risky_imports),
+        "insecure_list": [],
+        "risk_score": int(score),
+        "max_score": int(max_score),
+        "risk_level": "High" if score > 8 else "Medium" if score > 3 else "Low",
+        "headings": {
+            "details": "🔍 Suspicious Strings Found",
+            "risky": "🚨 Suspicious Imported Functions",
+            "insecure": " "
+        }
+    }
+    set_progress(task_id, 90, "Finalizing…")
+    return result
+
+# --- Worker ---
+def worker_scan(task_id, saved_path, filename, mode):
+    try:
+        set_progress(task_id, 3, "Starting scan…")
+        if filename.lower().endswith(".apk"):
+            if mode == "deep":
+                result = analyze_apk_deep(saved_path, task_id)
+            else:
+                result = analyze_apk_fast(saved_path, task_id)
+        elif filename.lower().endswith(".exe"):
+            result = analyze_exe(saved_path, task_id)
+        else:
+            raise RuntimeError("Unsupported file type. Upload .apk or .exe")
+
+        # Persist JSON
+        report_filename = f"{os.path.basename(saved_path)}.json"
+        report_path = os.path.join(REPORT_FOLDER, report_filename)
+        with open(report_path, "w", encoding="utf-8") as f:
+            json.dump(result, f, indent=2, ensure_ascii=False)
+
+        public_report_path = f"/reports/{report_filename}"
+        set_progress(task_id, 100, "Done", result=result, report_path=public_report_path, done=True)
+    except Exception as e:
+        set_progress(task_id, 100, f"Failed: {e}", error=str(e), done=True)
+    finally:
+        try:
+            if os.path.exists(saved_path):
+                os.remove(saved_path)
+        except Exception:
+            pass
+
+# --- Routes ---
 @app.route("/", methods=["GET", "POST"])
 def index():
     if request.method == "POST":
-        apk_file = request.files["apk"]
-        path = os.path.join(UPLOAD_FOLDER, apk_file.filename)
-        apk_file.save(path)
+        if "file" not in request.files:
+            return abort(400, "No file part")
+        f = request.files["file"]
+        if f.filename == "":
+            return abort(400, "No selected file")
 
-        try:
-            result = analyze_apk(path)
-        except Exception as e:
-            return f"<h3>Error analyzing APK:</h3><pre>{str(e)}</pre>"
+        mode = request.form.get("mode", "fast")  # fast|deep
+        filename = secure_filename(f.filename)
+        saved_path = os.path.join(UPLOAD_FOLDER, f"{uuid.uuid4().hex}_{filename}")
+        f.save(saved_path)
 
-        os.remove(path)
-        return render_template_string(RESULT_HTML, result=result)
+        task_id = init_task(mode)
+        th = threading.Thread(target=worker_scan, args=(task_id, saved_path, filename, mode), daemon=True)
+        th.start()
 
-    return render_template_string(INDEX_HTML)
+        return render_template("scan.html", task_id=task_id, mode=mode)
+    return render_template("index.html")
+
+@app.route("/progress/<task_id>")
+def progress(task_id):
+    with TASKS_LOCK:
+        data = TASKS.get(task_id)
+        if not data:
+            return jsonify({"error":"Invalid task id"}), 404
+        return jsonify({
+            "progress": data.get("progress", 0),
+            "status": data.get("status", "Working…"),
+            "done": data.get("done", False),
+            "error": data.get("error")
+        })
+
+@app.route("/result/<task_id>")
+def result(task_id):
+    with TASKS_LOCK:
+        data = TASKS.get(task_id)
+        if not data:
+            return abort(404, "Invalid task id")
+        res = data.get("result")
+        err = data.get("error")
+        report_path = data.get("report_path")
+    return render_template("report.html", task_id=task_id, result=res, error=err, report_path=report_path)
+
+@app.route("/reports/<path:name>")
+def serve_report(name):
+    safe = os.path.join(REPORT_FOLDER, os.path.basename(name))
+    if not os.path.exists(safe):
+        return abort(404)
+    with open(safe, "rb") as f:
+        content = f.read()
+    return app.response_class(content, mimetype="application/json")
 
 if __name__ == "__main__":
     app.run(debug=True)
